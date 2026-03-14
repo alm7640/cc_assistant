@@ -176,6 +176,10 @@ analyze_btn = st.button(
 if analyze_btn and uploaded_files:
     with st.spinner("Parsing files and running analysis..."):
         df, parse_warnings = combine_files(uploaded_files)
+        # Show any file-level parse warnings so the user knows which files failed
+        if parse_warnings:
+            for w in parse_warnings:
+                st.warning(w)
 
         if df.empty:
             st.error(
