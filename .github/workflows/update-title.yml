@@ -10,8 +10,9 @@ env:
 jobs:
   update-title:
     runs-on: ubuntu-latest
-    # Skip if the commit was made by this workflow itself (prevents infinite loop)
     if: github.actor != 'github-actions[bot]'
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
