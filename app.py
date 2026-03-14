@@ -5,6 +5,7 @@ import streamlit as st
 import pandas as pd
 import sys
 import os
+import re
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -126,6 +127,10 @@ with st.sidebar:
         )
 
     st.markdown("---")
+    debug_parse = st.checkbox(
+        "Show raw parsed text for failed uploads (debug)",
+        help="When enabled, the app will display/download the raw text extracted from files that failed parsing."
+    )
     st.markdown("### 📖 Tips")
     st.markdown("""
 - Upload **1 year minimum** for recurring detection
@@ -180,6 +185,40 @@ if analyze_btn and uploaded_files:
         if parse_warnings:
             for w in parse_warnings:
                 st.warning(w)
+
+        # If debug mode requested, show raw extracted text for failed filenames
+        if debug_parse and parse_warnings:
+            # filenames are enclosed in ** in the warning strings
+            failed = set()
+            for w in parse_warnings:
+                m = re.findall(r"\*\*(.*?)\*\*", w)
+                for name in m:
+                    failed.add(name)
+
+            from parser import extract_raw_text
+            for f in uploaded_files:
+                try:
+                    name = f.name
+                except Exception:
+                    continue
+                if name in failed:
+                    try:
+                        f.seek(0)
+                    except Exception:
+                        pass
+                    try:
+                        raw = extract_raw_text(f.read(), name)
+                    except Exception:
+                        raw = ""
+                    with st.expander(f"Raw extracted text for {name}"):
+                        st.text_area("Raw text", raw, height=300)
+                        if raw:
+                            st.download_button(
+                                label="Download raw text",
+                                data=raw,
+                                file_name=f"{name}.txt",
+                                mime="text/plain",
+                            )
 
         if df.empty:
             st.error(

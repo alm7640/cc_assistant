@@ -380,3 +380,57 @@ def combine_files(uploaded_files) -> tuple[pd.DataFrame, list[str]]:
             )
 
     return combined, warnings
+
+
+def extract_raw_text(file_bytes: bytes, filename: str) -> str:
+    """Return extracted plain text for debugging purposes for common file types.
+    Returns an empty string on failure.
+    """
+    ext = filename.lower().split(".")[-1]
+    try:
+        if ext == "pdf":
+            import pdfplumber
+            texts = []
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                for page in pdf.pages:
+                    texts.append(page.extract_text() or "")
+            return "\n\n--- PAGE BREAK ---\n\n".join(texts)
+
+        if ext in ("docx",):
+            import docx2txt
+            import tempfile, os
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+            try:
+                text = docx2txt.process(tmp_path) or ""
+            except Exception:
+                text = ""
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+            return text
+
+        if ext == "csv":
+            try:
+                return file_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                return ""
+
+        if ext in ("xls", "xlsx"):
+            try:
+                xl = pd.ExcelFile(io.BytesIO(file_bytes))
+                parts = []
+                for sheet in xl.sheet_names:
+                    df = xl.parse(sheet, dtype=str)
+                    parts.append(f"-- Sheet: {sheet} --\n" + df.to_csv(index=False))
+                return "\n\n".join(parts)
+            except Exception:
+                return ""
+
+    except Exception:
+        return ""
+
+    return ""
