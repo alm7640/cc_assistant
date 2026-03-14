@@ -155,11 +155,20 @@ def _parse_pdf(file_bytes: bytes, filename: str) -> pd.DataFrame:
     """
     Parse PDF credit card statements.
     Strategy 1: pdfplumber table extraction (structured)
-    Strategy 2: raw text line-by-line regex parsing (fallback)
+    Strategy 2: raw text full-date regex (MM/DD/YYYY style)
+    Strategy 3: two-date MM/DD format without year (Bank of America, etc.)
     """
     import pdfplumber
 
     rows = []
+    full_text = ""
+
+    # Extract text once for all text-based strategies
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    except Exception:
+        pass
 
     # ── Strategy 1: Table extraction ─────────────────────────────────────
     try:
@@ -169,7 +178,12 @@ def _parse_pdf(file_bytes: bytes, filename: str) -> pd.DataFrame:
                 for table in tables:
                     if not table or len(table) < 2:
                         continue
-                    headers = [str(h).strip().lower().replace(" ", "_") if h else "" for h in table[0]]
+                    # Normalize headers — collapse any whitespace (including \n from
+                    # multi-line header cells) into underscores
+                    headers = [
+                        re.sub(r'\s+', '_', str(h).strip().lower()) if h else ""
+                        for h in table[0]
+                    ]
                     for data_row in table[1:]:
                         if not data_row:
                             continue
@@ -217,41 +231,81 @@ def _parse_pdf(file_bytes: bytes, filename: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # ── Strategy 2: Text regex fallback ──────────────────────────────────
-    if not rows:
-        try:
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                full_text = "\n".join(
-                    page.extract_text() or "" for page in pdf.pages
-                )
+    # ── Strategy 2: Full-date regex (MM/DD/YYYY or YYYY-MM-DD etc.) ──────
+    if not rows and full_text:
+        pattern = re.compile(
+            r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s+"
+            r"([A-Za-z][^\d\n]{3,50})\s+"
+            r"\$?([\d,]+\.\d{2})"
+        )
+        for match in pattern.finditer(full_text):
+            date_str, desc, amt_str = match.groups()
+            date = _parse_date(date_str)
+            amt = _clean_amount(amt_str)
+            merchant_raw = desc.strip()
 
-            # Pattern: date  description  amount
-            # Covers formats like: 01/15/2024  STARBUCKS #1234  5.75
-            pattern = re.compile(
-                r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s+"
-                r"([A-Za-z][^\d\n]{3,50?}?)\s+"
-                r"\$?([\d,]+\.\d{2})"
-            )
-            for match in pattern.finditer(full_text):
-                date_str, desc, amt_str = match.groups()
-                date = _parse_date(date_str)
-                amt = _clean_amount(amt_str)
-                merchant_raw = desc.strip()
+            if date is None or amt is None or amt <= 0:
+                continue
+            if _looks_like_payment(merchant_raw, amt):
+                continue
 
-                if date is None or amt is None or amt <= 0:
-                    continue
-                if _looks_like_payment(merchant_raw, amt):
-                    continue
+            rows.append({
+                "date": date,
+                "raw_merchant": merchant_raw,
+                "merchant": normalize_merchant(merchant_raw),
+                "amount": amt,
+                "source_file": filename,
+            })
 
-                rows.append({
-                    "date": date,
-                    "raw_merchant": merchant_raw,
-                    "merchant": normalize_merchant(merchant_raw),
-                    "amount": amt,
-                    "source_file": filename,
-                })
-        except Exception:
-            pass
+    # ── Strategy 3: Two-date MM/DD format — Bank of America and similar ──
+    # Format: MM/DD  MM/DD  DESCRIPTION  REF(4)  ACCT(4)  AMOUNT
+    # Dates have no year; infer from statement period in the header text.
+    if not rows and full_text:
+        # Extract closing month/year from text like "December 13 - January 12, 2025"
+        closing_year = datetime.now().year
+        closing_month = datetime.now().month
+        period_match = re.search(
+            r'\w+\s+\d{1,2}\s*[-\u2013]\s*(\w+)\s+\d{1,2}[,\s]+(\d{4})',
+            full_text,
+        )
+        if period_match:
+            try:
+                closing_month = datetime.strptime(period_match.group(1), "%B").month
+                closing_year = int(period_match.group(2))
+            except ValueError:
+                pass
+
+        # Each transaction line: MM/DD  MM/DD  description  4digits  4digits  amount
+        boa_pattern = re.compile(
+            r"^(\d{2}/\d{2})\s+\d{2}/\d{2}\s+(.+?)\s+\d{4}\s+\d{4}\s+([\d,]+\.\d{2})\s*$",
+            re.MULTILINE,
+        )
+        for match in boa_pattern.finditer(full_text):
+            date_str, desc, amt_str = match.groups()
+            try:
+                month, day = map(int, date_str.split("/"))
+                # If transaction month is later in the year than the closing month,
+                # it belongs to the prior year (e.g. Dec txn in a Jan-closing statement)
+                year = closing_year - 1 if month > closing_month else closing_year
+                date = datetime(year, month, day)
+            except (ValueError, OverflowError):
+                continue
+
+            amt = _clean_amount(amt_str)
+            merchant_raw = desc.strip()
+
+            if amt is None or amt <= 0:
+                continue
+            if _looks_like_payment(merchant_raw, amt):
+                continue
+
+            rows.append({
+                "date": date,
+                "raw_merchant": merchant_raw,
+                "merchant": normalize_merchant(merchant_raw),
+                "amount": amt,
+                "source_file": filename,
+            })
 
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
