@@ -1,0 +1,29 @@
+name: Update app page title with latest commit time
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  update-title:
+    runs-on: ubuntu-latest
+    # Skip if the commit was made by this workflow itself (prevents infinite loop)
+    if: github.actor != 'github-actions[bot]'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set timestamp and update page_title in app.py
+        run: |
+          # Format: "Statement Analyzer — updated 2026-03-14 17:42 UTC"
+          TIMESTAMP=$(date -u "+%Y-%m-%d %H:%M UTC")
+          sed -i "s|page_title=.*|page_title=\"Statement Analyzer — updated ${TIMESTAMP}\",|" app.py
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add app.py
+          # Only commit if app.py actually changed
+          git diff --cached --quiet || git commit -m "chore: update page title timestamp [skip ci]"
+          git push
