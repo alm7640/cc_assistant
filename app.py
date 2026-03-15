@@ -24,7 +24,7 @@ from llm import get_ai_insights
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Statement Analyzer — updated 2026-03-14 23:18 UTC",
+    page_title="Statement Analyzer — updated 2026-03-15 00:15 UTC",
     page_icon="💳",
     layout="wide",
     initial_sidebar_state="expanded",
