@@ -68,6 +68,30 @@ def _parse_date(val) -> Optional[datetime]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Summary-page filter — shared across ALL PDF strategies
+# Pages containing these phrases are overview/totals pages, not transaction
+# listing pages. Skip them entirely to avoid pulling in summary rows.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SUMMARY_PAGE_SIGNALS = re.compile(
+    r"(account\s+summary|statement\s+summary|previous\s+balance"
+    r"|new\s+balance\s+total|credit\s+limit|minimum\s+payment\s+due"
+    r"|opening/closing\s+date|payment\s+information"
+    r"|total\s+credit\s+line|statement\s+closing\s+date)",
+    re.IGNORECASE,
+)
+
+# Merchant strings that look like statement summary rows, not real merchants.
+# Used to filter false positives from Strategy 2 regex matches.
+_FAKE_MERCHANT_SIGNALS = re.compile(
+    r"^(new balance|previous balance|minimum payment|payment due"
+    r"|total credit|interest charge|fees charged|purchases and adj"
+    r"|payments and other|statement closing|days in billing)",
+    re.IGNORECASE,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Format-specific parsers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -232,35 +256,54 @@ def _parse_pdf(file_bytes: bytes, filename: str) -> pd.DataFrame:
         pass
 
     # ── Strategy 2: Full-date regex (MM/DD/YYYY or YYYY-MM-DD etc.) ──────
+    # Runs page-by-page (not on full_text) so summary pages can be skipped.
     if not rows and full_text:
         pattern = re.compile(
             r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s+"
             r"([A-Za-z][^\d\n]{3,50})\s+"
             r"\$?([\d,]+\.\d{2})"
         )
-        for match in pattern.finditer(full_text):
-            date_str, desc, amt_str = match.groups()
-            date = _parse_date(date_str)
-            amt = _clean_amount(amt_str)
-            merchant_raw = desc.strip()
+        try:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                pages_text_s2 = [page.extract_text() or "" for page in pdf.pages]
+        except Exception:
+            pages_text_s2 = [full_text]
 
-            if date is None or amt is None or amt <= 0:
-                continue
-            if _looks_like_payment(merchant_raw, amt):
+        for page_text in pages_text_s2:
+            # Skip summary/overview pages — they contain balance totals that
+            # look like transactions but aren't (e.g. "New Balance Total $4,814")
+            if _SUMMARY_PAGE_SIGNALS.search(page_text):
                 continue
 
-            rows.append({
-                "date": date,
-                "raw_merchant": merchant_raw,
-                "merchant": normalize_merchant(merchant_raw),
-                "amount": amt,
-                "source_file": filename,
-            })
+            for match in pattern.finditer(page_text):
+                date_str, desc, amt_str = match.groups()
+                date = _parse_date(date_str)
+                amt = _clean_amount(amt_str)
+                merchant_raw = desc.strip()
+
+                if date is None or amt is None or amt <= 0:
+                    continue
+                if _looks_like_payment(merchant_raw, amt):
+                    continue
+                # Guard against summary row false positives
+                if _FAKE_MERCHANT_SIGNALS.search(merchant_raw):
+                    continue
+
+                rows.append({
+                    "date": date,
+                    "raw_merchant": merchant_raw,
+                    "merchant": normalize_merchant(merchant_raw),
+                    "amount": amt,
+                    "source_file": filename,
+                })
 
     # ── Strategy 3: Two-date MM/DD format — Bank of America and similar ──
     # Format: MM/DD  MM/DD  DESCRIPTION  REF(4)  ACCT(4)  AMOUNT
     # Dates have no year; infer from statement period in the header text.
-    if not rows and full_text:
+    # NOTE: Run this BEFORE Strategy 2, and independently of row count.
+    # BofA PDFs will always match here; if we get more hits than rows, use these.
+    s3_rows = []
+    if full_text:
         # Extract closing month/year from text like "December 13 - January 12, 2025"
         closing_year = datetime.now().year
         closing_month = datetime.now().month
@@ -279,15 +322,6 @@ def _parse_pdf(file_bytes: bytes, filename: str) -> pd.DataFrame:
         boa_pattern = re.compile(
             r"^(\d{2}/\d{2})\s+\d{2}/\d{2}\s+(.+?)\s+\d{4}\s+\d{4}\s+([\d,]+\.\d{2})\s*$",
             re.MULTILINE,
-        )
-
-        # Summary-page indicators: pages with these phrases are overview/totals pages,
-        # not transaction listing pages. Skip them to avoid pulling in summary rows.
-        _SUMMARY_PAGE_SIGNALS = re.compile(
-            r"(account\s+summary|statement\s+summary|previous\s+balance"
-            r"|new\s+balance|credit\s+limit|minimum\s+payment\s+due"
-            r"|opening/closing\s+date|payment\s+information)",
-            re.IGNORECASE,
         )
 
         try:
@@ -319,13 +353,18 @@ def _parse_pdf(file_bytes: bytes, filename: str) -> pd.DataFrame:
                 if _looks_like_payment(merchant_raw, amt):
                     continue
 
-                rows.append({
+                s3_rows.append({
                     "date": date,
                     "raw_merchant": merchant_raw,
                     "merchant": normalize_merchant(merchant_raw),
                     "amount": amt,
                     "source_file": filename,
                 })
+
+    # Strategy 3 wins if it found more transactions than earlier strategies
+    # (BofA PDFs always have many transactions; Strategy 2 false positives are few)
+    if len(s3_rows) > len(rows):
+        rows = s3_rows
 
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
